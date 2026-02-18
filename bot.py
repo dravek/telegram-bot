@@ -331,22 +331,36 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
+    # Load facts BEFORE any branching so both paths have access to them
+    facts = long_term.get_all(chat_id)
+
     # ── Auto-route: web research vs normal chat ───────────────────────────────
     if await _needs_search(user_text, research_provider):
         from agents.researcher import research  # local import keeps startup fast
 
+        # Enrich the search query with the user's long-term context
+        enriched_query = user_text
+        if facts:
+            facts_context = "; ".join(facts)
+            enriched_query = (
+                f"{user_text}\n\n"
+                f"[User context for this search: {facts_context}]"
+            )
+
         try:
             answer = await research(
-                user_text,
+                enriched_query,
                 research_provider,
                 mode_name="default",
                 cache_ttl=config.search_cache_ttl,
                 default_sources=config.research_results,
                 default_snippet_chars=config.research_snippet_chars,
             )
-            # Research results are intentionally not stored in chat memory —
-            # they are long and would inflate context on every future turn.
             await update.message.reply_text(answer)  # type: ignore[union-attr]
+            # Extract and persist any memorable facts from this message too
+            asyncio.create_task(
+                _store_extracted_facts(chat_id, user_text, research_provider, long_term)
+            )
         except Exception as exc:
             logger.error(
                 "Auto-research error for chat %d: %s", chat_id, exc, exc_info=True
