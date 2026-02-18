@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-ai-bot"
+version = "1.0.0"
+description = "A minimal Telegram bot backed by OpenAI or Anthropic"
+requires-python = ">=3.12"
+dependencies = [
+    "python-telegram-bot>=21.0",
+    "openai>=1.30",
+    "anthropic>=0.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3.14",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["providers*"]
+
+[tool.setuptools]
+py-modules = ["app", "bot", "config", "memory"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
