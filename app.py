@@ -12,7 +12,7 @@ import logging
 import sys
 
 from config import load_config
-from memory import ConversationMemory
+from memory import ConversationMemory, LongTermMemory
 from bot import build_application
 
 
@@ -73,14 +73,16 @@ def main() -> None:
         )
 
     memory = ConversationMemory(max_size=config.memory_size)
-    application = build_application(config, provider, memory, research_provider)
+    long_term_memory = LongTermMemory(db_path=config.memory_db_path)
+    application = build_application(config, provider, memory, research_provider, long_term_memory)
 
     logger.info(
-        "Bot starting — provider=%s model=%s research_model=%s memory_size=%d",
+        "Bot starting — provider=%s model=%s research_model=%s memory_size=%d long_term_memory_db=%s",
         provider.name,
         provider.model,
         research_provider.model,
         config.memory_size,
+        config.memory_db_path,
     )
 
     application.run_polling(

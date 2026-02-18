@@ -5,7 +5,10 @@ v21+.  Shared state (provider, memory) is stored in ``context.bot_data`` so
 handlers remain stateless functions rather than methods on a class.
 """
 
+import asyncio
+import json
 import logging
+import re
 import time
 from datetime import timedelta
 
@@ -19,7 +22,7 @@ from telegram.ext import (
 )
 
 from config import Config
-from memory import ConversationMemory
+from memory import ConversationMemory, LongTermMemory
 from providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
@@ -29,6 +32,63 @@ SYSTEM_PROMPT = (
     "Keep your answers short and to the point unless the user asks you to elaborate. "
     "If you don't know something, say so honestly."
 )
+
+# ── Long-term memory helpers ──────────────────────────────────────────────────
+
+_FACT_EXTRACTOR_SYSTEM = (
+    "Extract personal facts worth remembering long-term from the user's message.\n"
+    "Examples: user's name or nickname, bot name, location, language preference, "
+    "relationships, likes/dislikes.\n"
+    "Return ONLY a JSON array of short fact strings, e.g.:\n"
+    '["User\'s name is David", "User wants the bot to be called Jarvis"]\n'
+    "Return an empty array [] if there is nothing worth remembering.\n"
+    "Be concise. One fact per item. No explanation outside the JSON array."
+)
+
+
+def _build_system_prompt(facts: list[str]) -> str:
+    """Return the system prompt, optionally enriched with long-term facts."""
+    if not facts:
+        return SYSTEM_PROMPT
+    facts_block = "\n".join(f"- {f}" for f in facts)
+    return (
+        SYSTEM_PROMPT
+        + "\n\n## What you know about this user (long-term memory)\n"
+        + facts_block
+    )
+
+
+async def _extract_facts(text: str, provider: BaseProvider) -> list[str]:
+    """Ask the LLM to extract any memorable facts from *text*.
+
+    Returns a (possibly empty) list of fact strings.  Never raises — any
+    error is logged and an empty list is returned so the main flow continues.
+    """
+    try:
+        result = await provider.complete(
+            [{"role": "user", "content": text}],
+            system=_FACT_EXTRACTOR_SYSTEM,
+        )
+        match = re.search(r"\[.*?\]", result, re.DOTALL)
+        if not match:
+            return []
+        facts = json.loads(match.group())
+        return [f for f in facts if isinstance(f, str) and f.strip()]
+    except Exception as exc:
+        logger.warning("Fact extraction failed: %s", exc)
+        return []
+
+
+async def _store_extracted_facts(
+    chat_id: int,
+    text: str,
+    provider: BaseProvider,
+    long_term: LongTermMemory,
+) -> None:
+    """Background task: extract facts from *text* and persist them."""
+    facts = await _extract_facts(text, provider)
+    for fact in facts:
+        long_term.add(chat_id, fact)
 
 _START_TIME = time.monotonic()
 
@@ -105,6 +165,10 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/provider — show the active AI provider and model\n"
         "/reset    — clear your conversation history\n"
         "/research — explicit web research with optional depth flag\n\n"
+        "*Long-term memory* 🧠\n"
+        "/memories         — list everything I remember about you\n"
+        "/remember <fact>  — manually store a fact\n"
+        "/forget           — wipe all my long-term memories\n\n"
         "*Auto-search* 🔍\n"
         "You don't need commands for web searches. Just ask naturally:\n"
         "  _\"what's the latest AI news?\"\n"
@@ -136,6 +200,52 @@ async def reset_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     chat_id = update.effective_chat.id  # type: ignore[union-attr]
     memory.reset(chat_id)
     await update.message.reply_text("✅ Conversation history cleared.")  # type: ignore[union-attr]
+
+
+async def memories_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /memories — list all stored long-term facts for this chat."""
+    long_term: LongTermMemory = context.bot_data["long_term_memory"]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    facts = long_term.get_all(chat_id)
+    if not facts:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "🧠 I don't have any long-term memories yet.\n"
+            "Just tell me things like your name or what to call me!"
+        )
+        return
+    lines = "\n".join(f"{i + 1}. {f}" for i, f in enumerate(facts))
+    await update.message.reply_text(  # type: ignore[union-attr]
+        f"🧠 *What I remember about you:*\n\n{lines}",
+        parse_mode="Markdown",
+    )
+
+
+async def remember_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /remember <fact> — manually store a long-term fact."""
+    long_term: LongTermMemory = context.bot_data["long_term_memory"]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    fact = " ".join(context.args or []).strip()
+    if not fact:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Usage: /remember <fact>\nExample: /remember My dog is called Rex"
+        )
+        return
+    stored = long_term.add(chat_id, fact)
+    if stored:
+        await update.message.reply_text("✅ Got it, I'll remember that!")  # type: ignore[union-attr]
+    else:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            f"⚠️ Memory is full ({LongTermMemory.MAX_FACTS} facts). "
+            "Use /forget to clear it first."
+        )
+
+
+async def forget_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /forget — wipe all long-term memories for this chat."""
+    long_term: LongTermMemory = context.bot_data["long_term_memory"]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    long_term.clear(chat_id)
+    await update.message.reply_text("🗑️ Long-term memories cleared.")  # type: ignore[union-attr]
 
 
 # ── Research handler ──────────────────────────────────────────────────────────
@@ -211,6 +321,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     provider: BaseProvider = context.bot_data["provider"]
     research_provider: BaseProvider = context.bot_data["research_provider"]
     memory: ConversationMemory = context.bot_data["memory"]
+    long_term: LongTermMemory = context.bot_data["long_term_memory"]
     config: Config = context.bot_data["config"]
     chat_id = update.effective_chat.id  # type: ignore[union-attr]
     user_text = (update.message.text or "").strip()  # type: ignore[union-attr]
@@ -249,11 +360,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # ── Normal chat with memory ───────────────────────────────────────────────
     memory.add(chat_id, "user", user_text)
     messages = memory.get(chat_id)
+    system_prompt = _build_system_prompt(long_term.get_all(chat_id))
 
     try:
-        reply = await provider.complete(messages, system=SYSTEM_PROMPT)
+        reply = await provider.complete(messages, system=system_prompt)
         memory.add(chat_id, "assistant", reply)
         await update.message.reply_text(reply)  # type: ignore[union-attr]
+        # Extract and store any memorable facts in the background (no latency cost)
+        asyncio.create_task(
+            _store_extracted_facts(chat_id, user_text, research_provider, long_term)
+        )
 
     except PermissionError:
         logger.warning("403 permission error for chat %d", chat_id)
@@ -280,6 +396,7 @@ def build_application(
     provider: BaseProvider,
     memory: ConversationMemory,
     research_provider: BaseProvider,
+    long_term_memory: LongTermMemory,
 ) -> Application:
     """Build and configure the Telegram :class:`Application`.
 
@@ -292,6 +409,7 @@ def build_application(
         memory:             Shared per-chat conversation memory.
         research_provider:  LLM provider instance for research summarisation
                             (may be the same object as *provider*).
+        long_term_memory:   Persistent SQLite-backed fact store.
 
     Returns:
         A fully configured :class:`Application` ready to call
@@ -307,12 +425,16 @@ def build_application(
     app.bot_data["provider"] = provider
     app.bot_data["memory"] = memory
     app.bot_data["research_provider"] = research_provider
+    app.bot_data["long_term_memory"] = long_term_memory
 
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CommandHandler("ping", ping_handler))
     app.add_handler(CommandHandler("provider", provider_handler))
     app.add_handler(CommandHandler("reset", reset_handler))
+    app.add_handler(CommandHandler("memories", memories_handler))
+    app.add_handler(CommandHandler("remember", remember_handler))
+    app.add_handler(CommandHandler("forget", forget_handler))
     app.add_handler(CommandHandler("research", research_handler))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler)

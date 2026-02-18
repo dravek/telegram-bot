@@ -28,6 +28,7 @@ class Config:
     research_results: int           # default source count
     research_snippet_chars: int     # chars extracted per page
     search_cache_ttl: int           # seconds to cache search results
+    memory_db_path: str             # path to SQLite file for long-term memory
 
 
 def load_config() -> Config:
@@ -112,6 +113,7 @@ def load_config() -> Config:
         research_results=research_results,
         research_snippet_chars=research_snippet_chars,
         search_cache_ttl=search_cache_ttl,
+        memory_db_path=os.getenv("MEMORY_DB_PATH", "memory.db"),
     )
 
 
