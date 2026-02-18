@@ -338,23 +338,20 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if await _needs_search(user_text, research_provider):
         from agents.researcher import research  # local import keeps startup fast
 
-        # Enrich the search query with the user's long-term context
-        enriched_query = user_text
+        # Pass user context to the summariser only, NOT to the search engine
+        context_note = ""
         if facts:
-            facts_context = "; ".join(facts)
-            enriched_query = (
-                f"{user_text}\n\n"
-                f"[User context for this search: {facts_context}]"
-            )
+            context_note = "\n\n[User context: " + "; ".join(facts) + "]"
 
         try:
             answer = await research(
-                enriched_query,
+                user_text,
                 research_provider,
                 mode_name="default",
                 cache_ttl=config.search_cache_ttl,
                 default_sources=config.research_results,
                 default_snippet_chars=config.research_snippet_chars,
+                context_note=context_note,
             )
             await update.message.reply_text(answer)  # type: ignore[union-attr]
             # Extract and persist any memorable facts from this message too
@@ -374,7 +371,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # ── Normal chat with memory ───────────────────────────────────────────────
     memory.add(chat_id, "user", user_text)
     messages = memory.get(chat_id)
-    system_prompt = _build_system_prompt(long_term.get_all(chat_id))
+    system_prompt = _build_system_prompt(facts)  # reuse already-loaded facts
 
     try:
         reply = await provider.complete(messages, system=system_prompt)

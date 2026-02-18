@@ -211,6 +211,7 @@ async def research(
     cache_ttl: int = 180,
     default_sources: int = 5,
     default_snippet_chars: int = 1200,
+    context_note: str = "",
 ) -> str:
     """Run the full research pipeline and return a cited plain-text answer.
 
@@ -314,7 +315,7 @@ async def research(
     logger.info("Assembled %d sources for summarisation", len(sources))
 
     # ── 6. Summarise ──────────────────────────────────────────────────────────
-    prompt = _build_prompt(query, sources)
+    prompt = _build_prompt(query + context_note, sources)
     messages: list[Message] = [{"role": "user", "content": prompt}]
 
     try:
