@@ -32,6 +32,50 @@ SYSTEM_PROMPT = (
 
 _START_TIME = time.monotonic()
 
+# ── LLM-based search intent router ───────────────────────────────────────────
+
+# The router prompt is intentionally terse — we want exactly one word back.
+# Using the research_provider (cheap model) keeps the cost negligible:
+# ~50 input tokens + 1 output token ≈ $0.000008 per message with gpt-4o-mini.
+_ROUTER_SYSTEM = (
+    "You are a routing assistant. Decide if the user's message requires "
+    "searching the web for current or live information.\n"
+    "Reply with ONLY one word — no explanation, no punctuation:\n"
+    "  SEARCH  — if the user wants news, current events, live prices, recent "
+    "information, or explicitly asks to search/find/look something up.\n"
+    "  CHAT    — if it is a general question, creative task, coding help, "
+    "explanation, or anything that does not need live web data.\n"
+    "Reply with ONLY the single word SEARCH or CHAT."
+)
+
+
+async def _needs_search(text: str, provider: BaseProvider) -> bool:
+    """Ask the LLM whether *text* requires a live web search.
+
+    Uses the research provider (cheapest configured model) for a single
+    low-token classification call.  Defaults to ``False`` (normal chat) on
+    any error so the bot never blocks on a routing failure.
+
+    Works in any language — the LLM handles the classification regardless of
+    what language the user writes in.
+
+    Args:
+        text:     The user's message.
+        provider: LLM provider to use for classification.
+
+    Returns:
+        ``True`` if a web search should be performed.
+    """
+    try:
+        result = await provider.complete(
+            [{"role": "user", "content": text}],
+            system=_ROUTER_SYSTEM,
+        )
+        return result.strip().upper().startswith("SEARCH")
+    except Exception as exc:
+        logger.warning("Router LLM call failed, defaulting to CHAT: %s", exc)
+        return False
+
 
 def _uptime() -> str:
     """Return a human-readable uptime string, e.g. ``"1:23:45"``."""
@@ -45,8 +89,9 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Handle the /start command — send a brief greeting."""
     await update.message.reply_text(  # type: ignore[union-attr]
         "👋 Hi! I'm an AI-powered Telegram bot.\n\n"
-        "Send me any message to start chatting, or use /help for a list of commands.\n"
-        "The active AI provider is shown with /provider."
+        "Just chat with me naturally — I'll search the web automatically "
+        "when you ask about news, prices, or anything current.\n\n"
+        "Use /help to see all commands."
     )
 
 
@@ -59,9 +104,14 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/ping     — check the bot is alive + uptime\n"
         "/provider — show the active AI provider and model\n"
         "/reset    — clear your conversation history\n"
-        "/research — research a topic and get a cited summary\n\n"
-        "Just type any message to chat with the AI.\n\n"
-        "💡 Switch providers by setting `LLM_PROVIDER=openai` or `LLM_PROVIDER=anthropic`.",
+        "/research — explicit web research with optional depth flag\n\n"
+        "*Auto-search* 🔍\n"
+        "You don't need commands for web searches. Just ask naturally:\n"
+        "  _\"what's the latest AI news?\"\n"
+        "  \"find me Python tutorials\"\n"
+        "  \"what happened with OpenAI today\"_\n\n"
+        "For deeper research: `/research --deep <topic>`\n\n"
+        "💡 Switch providers: set `LLM_PROVIDER=openai` or `=anthropic`.",
         parse_mode="Markdown",
     )
 
@@ -151,19 +201,54 @@ async def research_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # ── Natural language handler ──────────────────────────────────────────────────
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle plain-text messages — call the AI provider and reply."""
+    """Handle plain-text messages — auto-route to web research or normal chat.
+
+    If the message contains signals that fresh web information is needed
+    (news, prices, current events, explicit search requests) the research
+    pipeline is invoked automatically.  Otherwise the message goes to the
+    normal chat path with conversation memory.
+    """
     provider: BaseProvider = context.bot_data["provider"]
+    research_provider: BaseProvider = context.bot_data["research_provider"]
     memory: ConversationMemory = context.bot_data["memory"]
+    config: Config = context.bot_data["config"]
     chat_id = update.effective_chat.id  # type: ignore[union-attr]
     user_text = (update.message.text or "").strip()  # type: ignore[union-attr]
 
     if not user_text:
         return
 
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    # ── Auto-route: web research vs normal chat ───────────────────────────────
+    if await _needs_search(user_text, research_provider):
+        from agents.researcher import research  # local import keeps startup fast
+
+        try:
+            answer = await research(
+                user_text,
+                research_provider,
+                mode_name="default",
+                cache_ttl=config.search_cache_ttl,
+                default_sources=config.research_results,
+                default_snippet_chars=config.research_snippet_chars,
+            )
+            # Research results are intentionally not stored in chat memory —
+            # they are long and would inflate context on every future turn.
+            await update.message.reply_text(answer)  # type: ignore[union-attr]
+        except Exception as exc:
+            logger.error(
+                "Auto-research error for chat %d: %s", chat_id, exc, exc_info=True
+            )
+            await update.message.reply_text(  # type: ignore[union-attr]
+                "⚠️ I tried searching the web but something went wrong. "
+                "Try /research <query> or rephrase your question."
+            )
+        return
+
+    # ── Normal chat with memory ───────────────────────────────────────────────
     memory.add(chat_id, "user", user_text)
     messages = memory.get(chat_id)
-
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
         reply = await provider.complete(messages, system=SYSTEM_PROMPT)
@@ -172,7 +257,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     except PermissionError:
         logger.warning("403 permission error for chat %d", chat_id)
-        # Remove the user message we already stored so memory stays consistent
         memory.reset(chat_id)
         await update.message.reply_text(  # type: ignore[union-attr]
             "I don't have access to that resource (403). "
