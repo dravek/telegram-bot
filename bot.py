@@ -45,17 +45,29 @@ _FACT_EXTRACTOR_SYSTEM = (
     "Be concise. One fact per item. No explanation outside the JSON array."
 )
 
+_SUMMARIZER_SYSTEM = (
+    "You are a conversation summariser. Given an optional existing summary and "
+    "a block of chat messages, produce a single concise paragraph (max 120 words) "
+    "that captures the key topics, decisions, and context.\n"
+    "If an existing summary is provided, merge it with the new messages.\n"
+    "Write in the third person: 'The user asked about...', 'The assistant explained...'.\n"
+    "Return ONLY the summary paragraph — no headings, no extra text."
+)
 
-def _build_system_prompt(facts: list[str]) -> str:
-    """Return the system prompt, optionally enriched with long-term facts."""
-    if not facts:
-        return SYSTEM_PROMPT
-    facts_block = "\n".join(f"- {f}" for f in facts)
-    return (
-        SYSTEM_PROMPT
-        + "\n\n## What you know about this user (long-term memory)\n"
-        + facts_block
-    )
+
+def _build_system_prompt(facts: list[str], summary: str | None = None) -> str:
+    """Return the system prompt, enriched with rolling summary and long-term facts."""
+    parts = [SYSTEM_PROMPT]
+    if summary:
+        parts.append(
+            "\n\n## Earlier conversation summary\n" + summary
+        )
+    if facts:
+        facts_block = "\n".join(f"- {f}" for f in facts)
+        parts.append(
+            "\n\n## What you know about this user (long-term memory)\n" + facts_block
+        )
+    return "".join(parts)
 
 
 async def _extract_facts(text: str, provider: BaseProvider) -> list[str]:
@@ -85,10 +97,46 @@ async def _store_extracted_facts(
     provider: BaseProvider,
     long_term: LongTermMemory,
 ) -> None:
-    """Background task: extract facts from *text* and persist them."""
+    """Background task: extract facts from *text* and persist them.
+
+    Skips very short messages (fewer than 5 words) to avoid wasting LLM tokens.
+    """
+    if len(text.split()) < 5:
+        return
     facts = await _extract_facts(text, provider)
     for fact in facts:
         long_term.add(chat_id, fact)
+
+
+async def _update_rolling_summary(
+    chat_id: int,
+    old_messages: list,
+    existing_summary: str | None,
+    provider: BaseProvider,
+    memory: ConversationMemory,
+) -> None:
+    """Background task: condense *old_messages* into a rolling summary.
+
+    Merges with *existing_summary* if present, then persists the result so
+    the next conversation turn can inject it into the system prompt.
+    """
+    try:
+        transcript = "\n".join(
+            f"{m['role'].upper()}: {m['content']}" for m in old_messages
+        )
+        if existing_summary:
+            user_content = (
+                f"Existing summary:\n{existing_summary}\n\nNew messages:\n{transcript}"
+            )
+        else:
+            user_content = transcript
+        result = await provider.complete(
+            [{"role": "user", "content": user_content}],
+            system=_SUMMARIZER_SYSTEM,
+        )
+        memory.set_summary(chat_id, result.strip())
+    except Exception as exc:
+        logger.warning("Rolling summarisation failed for chat %d: %s", chat_id, exc)
 
 _START_TIME = time.monotonic()
 
@@ -369,9 +417,22 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # ── Normal chat with memory ───────────────────────────────────────────────
+    # Rolling summarisation: when the buffer is nearly full, pop the oldest
+    # half and condense it in the background so old context is never silently lost.
+    if memory.count(chat_id) >= memory.max_size - 1:
+        old_msgs = memory.pop_oldest(chat_id, memory.max_size // 2)
+        if old_msgs:
+            asyncio.create_task(
+                _update_rolling_summary(
+                    chat_id, old_msgs, memory.get_summary(chat_id),
+                    research_provider, memory,
+                )
+            )
+
     memory.add(chat_id, "user", user_text)
     messages = memory.get(chat_id)
-    system_prompt = _build_system_prompt(facts)  # reuse already-loaded facts
+    summary = memory.get_summary(chat_id)
+    system_prompt = _build_system_prompt(facts, summary)  # reuse already-loaded facts
 
     try:
         reply = await provider.complete(messages, system=system_prompt)

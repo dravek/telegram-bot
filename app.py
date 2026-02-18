@@ -72,7 +72,7 @@ def main() -> None:
             else provider
         )
 
-    memory = ConversationMemory(max_size=config.memory_size)
+    memory = ConversationMemory(max_size=config.memory_size, db_path=config.memory_db_path)
     long_term_memory = LongTermMemory(db_path=config.memory_db_path)
     application = build_application(config, provider, memory, research_provider, long_term_memory)
 

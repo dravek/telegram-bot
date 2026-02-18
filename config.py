@@ -59,7 +59,7 @@ def load_config() -> Config:
             "ANTHROPIC_API_KEY must be set when LLM_PROVIDER=anthropic."
         )
 
-    raw_memory = os.getenv("MEMORY_SIZE", "10")
+    raw_memory = os.getenv("MEMORY_SIZE", "30")
     try:
         memory_size = int(raw_memory)
         if memory_size < 1:
