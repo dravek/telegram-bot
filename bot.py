@@ -39,8 +39,13 @@ _FACT_EXTRACTOR_SYSTEM = (
     "Extract personal facts worth remembering long-term from the user's message.\n"
     "Examples: user's name or nickname, bot name, location, language preference, "
     "relationships, likes/dislikes.\n"
-    "Return ONLY a JSON array of short fact strings, e.g.:\n"
-    '["User\'s name is David", "User wants the bot to be called Jarvis"]\n'
+    "If an existing fact list is provided after '---EXISTING FACTS---', check whether\n"
+    "any new fact *updates* or *replaces* an existing one (e.g. a new name supersedes\n"
+    "an old name). In that case set the 'replaces' field to the exact existing fact\n"
+    "string it supersedes; otherwise leave 'replaces' as null.\n"
+    "Return ONLY a JSON array of objects, e.g.:\n"
+    '[{"fact": "User\'s name is David", "replaces": null},\n'
+    ' {"fact": "User wants the bot to be called Jarvis", "replaces": "Bot name is Max"}]\n'
     "Return an empty array [] if there is nothing worth remembering.\n"
     "Be concise. One fact per item. No explanation outside the JSON array."
 )
@@ -70,22 +75,40 @@ def _build_system_prompt(facts: list[str], summary: str | None = None) -> str:
     return "".join(parts)
 
 
-async def _extract_facts(text: str, provider: BaseProvider) -> list[str]:
-    """Ask the LLM to extract any memorable facts from *text*.
+async def _extract_facts(
+    text: str, provider: BaseProvider, existing_facts: list[str] | None = None
+) -> list[dict]:
+    """Ask the LLM to extract memorable facts from *text*.
 
-    Returns a (possibly empty) list of fact strings.  Never raises — any
-    error is logged and an empty list is returned so the main flow continues.
+    Returns a (possibly empty) list of ``{"fact": str, "replaces": str|None}``
+    dicts.  Never raises — errors are logged and an empty list is returned.
     """
     try:
+        content = text
+        if existing_facts:
+            content += (
+                "\n\n---EXISTING FACTS---\n"
+                + "\n".join(f"- {f}" for f in existing_facts)
+            )
         result = await provider.complete(
-            [{"role": "user", "content": text}],
+            [{"role": "user", "content": content}],
             system=_FACT_EXTRACTOR_SYSTEM,
         )
         match = re.search(r"\[.*?\]", result, re.DOTALL)
         if not match:
             return []
-        facts = json.loads(match.group())
-        return [f for f in facts if isinstance(f, str) and f.strip()]
+        raw = json.loads(match.group())
+        out = []
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                # Tolerate plain-string fallback from older prompts
+                out.append({"fact": item.strip(), "replaces": None})
+            elif isinstance(item, dict) and isinstance(item.get("fact"), str):
+                out.append({
+                    "fact": item["fact"].strip(),
+                    "replaces": item.get("replaces") or None,
+                })
+        return out
     except Exception as exc:
         logger.warning("Fact extraction failed: %s", exc)
         return []
@@ -100,12 +123,19 @@ async def _store_extracted_facts(
     """Background task: extract facts from *text* and persist them.
 
     Skips very short messages (fewer than 5 words) to avoid wasting LLM tokens.
+    Uses existing facts as context so the extractor can detect updates/replacements.
     """
     if len(text.split()) < 5:
         return
-    facts = await _extract_facts(text, provider)
-    for fact in facts:
-        long_term.add(chat_id, fact)
+    existing = long_term.get_all(chat_id)
+    items = await _extract_facts(text, provider, existing_facts=existing or None)
+    for item in items:
+        fact = item["fact"]
+        replaces = item["replaces"]
+        if replaces:
+            long_term.replace_fact(chat_id, replaces, fact)
+        else:
+            long_term.add(chat_id, fact)
 
 
 async def _update_rolling_summary(
@@ -140,49 +170,71 @@ async def _update_rolling_summary(
 
 _START_TIME = time.monotonic()
 
-# ── LLM-based search intent router ───────────────────────────────────────────
+# ── LLM-based intent router ───────────────────────────────────────────────────
 
-# The router prompt is intentionally terse — we want exactly one word back.
-# Using the research_provider (cheap model) keeps the cost negligible:
-# ~50 input tokens + 1 output token ≈ $0.000008 per message with gpt-4o-mini.
+# Returns JSON so the LLM can also rewrite the search query in context, which
+# lets it resolve references like "find more about what we discussed" or handle
+# complex sentences such as "while chatting, also look up the latest rates".
 _ROUTER_SYSTEM = (
-    "You are a routing assistant. Decide if the user's message requires "
-    "searching the web for current or live information.\n"
-    "Reply with ONLY one word — no explanation, no punctuation:\n"
-    "  SEARCH  — if the user wants news, current events, live prices, recent "
-    "information, or explicitly asks to search/find/look something up.\n"
-    "  CHAT    — if it is a general question, creative task, coding help, "
-    "explanation, or anything that does not need live web data.\n"
-    "Reply with ONLY the single word SEARCH or CHAT."
+    "You are a routing assistant. Analyse the user's latest message and the\n"
+    "optional conversation context provided.\n\n"
+    "Decide whether the request needs a live web search for current or recent\n"
+    "information (news, prices, events, explicit search/research requests).\n\n"
+    "Return ONLY a single-line JSON object — no explanation, no markdown:\n"
+    '  {"action": "SEARCH", "query": "<concise keyword search query>"}\n'
+    '  {"action": "CHAT"}\n\n'
+    "Rules for the query field (only when action is SEARCH):\n"
+    "- Extract ONLY the search-worthy part; strip conversational fluff.\n"
+    "- Use conversation context to resolve vague references "
+    '(e.g. "that topic" → actual topic name).\n'
+    "- Keep it under 80 characters, keyword-style.\n\n"
+    "Choose SEARCH when the user wants: news, current events, live prices,\n"
+    "recent information, or explicitly says search/find/look up/research.\n"
+    "Choose CHAT for everything else: explanations, creative tasks, coding,\n"
+    "opinions, follow-up questions on already-retrieved information."
 )
 
 
-async def _needs_search(text: str, provider: BaseProvider) -> bool:
-    """Ask the LLM whether *text* requires a live web search.
+async def _route_message(
+    text: str,
+    context_snippet: str,
+    provider: BaseProvider,
+) -> tuple[bool, str]:
+    """Decide if *text* needs a web search; return ``(needs_search, refined_query)``.
 
-    Uses the research provider (cheapest configured model) for a single
-    low-token classification call.  Defaults to ``False`` (normal chat) on
-    any error so the bot never blocks on a routing failure.
-
-    Works in any language — the LLM handles the classification regardless of
-    what language the user writes in.
+    Passes recent conversation context so the router can resolve vague references
+    and extract a clean search query from complex, multi-part sentences.
+    Defaults to ``(False, text)`` on any error so the bot never blocks.
 
     Args:
-        text:     The user's message.
-        provider: LLM provider to use for classification.
+        text:             The user's latest message.
+        context_snippet:  Last few turns + rolling summary for reference resolution.
+        provider:         LLM provider used for classification.
 
     Returns:
-        ``True`` if a web search should be performed.
+        Tuple of (needs_search, refined_query).  ``refined_query`` is a clean
+        keyword string suitable for DDG; falls back to the original *text*.
     """
     try:
+        content = text
+        if context_snippet:
+            content = f"[Conversation context]\n{context_snippet}\n\n[Latest message]\n{text}"
         result = await provider.complete(
-            [{"role": "user", "content": text}],
+            [{"role": "user", "content": content}],
             system=_ROUTER_SYSTEM,
         )
-        return result.strip().upper().startswith("SEARCH")
+        # Extract the first JSON object from the response
+        match = re.search(r"\{.*?\}", result.strip(), re.DOTALL)
+        if not match:
+            return False, text
+        data = json.loads(match.group())
+        if data.get("action", "").upper() == "SEARCH":
+            query = (data.get("query") or text).strip() or text
+            return True, query
+        return False, text
     except Exception as exc:
         logger.warning("Router LLM call failed, defaulting to CHAT: %s", exc)
-        return False
+        return False, text
 
 
 def _uptime() -> str:
@@ -381,19 +433,41 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # Load facts BEFORE any branching so both paths have access to them
     facts = long_term.get_all(chat_id)
+    summary = memory.get_summary(chat_id)
+
+    # Build a brief context snippet for the router so it can resolve references
+    # like "that topic" or understand multi-part sentences.
+    recent_msgs = memory.get(chat_id)[-6:]  # last 3 turns (6 messages max)
+    context_parts: list[str] = []
+    if summary:
+        context_parts.append(f"Summary: {summary}")
+    if recent_msgs:
+        context_parts.append(
+            "\n".join(f"{m['role'].upper()}: {m['content']}" for m in recent_msgs)
+        )
+    context_snippet = "\n".join(context_parts)
 
     # ── Auto-route: web research vs normal chat ───────────────────────────────
-    if await _needs_search(user_text, research_provider):
+    needs_search, refined_query = await _route_message(
+        user_text, context_snippet, research_provider
+    )
+    if needs_search:
         from agents.researcher import research  # local import keeps startup fast
 
-        # Pass user context to the summariser only, NOT to the search engine
-        context_note = ""
+        # Pass user context + rolling summary to the summariser
+        research_context_parts: list[str] = []
+        if summary:
+            research_context_parts.append(f"Conversation summary: {summary}")
         if facts:
-            context_note = "\n\n[User context: " + "; ".join(facts) + "]"
+            research_context_parts.append("User context: " + "; ".join(facts))
+        context_note = (
+            "\n\n[" + " | ".join(research_context_parts) + "]"
+            if research_context_parts else ""
+        )
 
         try:
             answer = await research(
-                user_text,
+                refined_query,
                 research_provider,
                 mode_name="default",
                 cache_ttl=config.search_cache_ttl,
@@ -402,6 +476,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 context_note=context_note,
             )
             await update.message.reply_text(answer)  # type: ignore[union-attr]
+
+            # Add research exchange to conversation memory so follow-ups work
+            memory.add(chat_id, "user", user_text)
+            memory.add(chat_id, "assistant", answer)
+
             # Extract and persist any memorable facts from this message too
             asyncio.create_task(
                 _store_extracted_facts(chat_id, user_text, research_provider, long_term)
@@ -431,8 +510,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     memory.add(chat_id, "user", user_text)
     messages = memory.get(chat_id)
-    summary = memory.get_summary(chat_id)
-    system_prompt = _build_system_prompt(facts, summary)  # reuse already-loaded facts
+    system_prompt = _build_system_prompt(facts, summary)  # reuse already-loaded facts and summary
 
     try:
         reply = await provider.complete(messages, system=system_prompt)

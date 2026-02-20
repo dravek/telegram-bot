@@ -10,3 +10,5 @@ build/
 .mypy_cache/
 *.log
 memory.db
+memory.db-shm
+memory.db-wal

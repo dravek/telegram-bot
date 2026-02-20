@@ -194,22 +194,40 @@ class LongTermMemory:
             self._conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS long_term_memory (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id    INTEGER NOT NULL,
-                    fact       TEXT    NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id       INTEGER NOT NULL,
+                    fact          TEXT    NOT NULL,
+                    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS idx_ltm_chat
                     ON long_term_memory(chat_id);
                 """
             )
+            # Backwards-compatible migration: add last_accessed if missing
+            cols = {
+                row[1]
+                for row in self._conn.execute(
+                    "PRAGMA table_info(long_term_memory)"
+                ).fetchall()
+            }
+            if "last_accessed" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE long_term_memory"
+                    " ADD COLUMN last_accessed TIMESTAMP"
+                )
+                self._conn.execute(
+                    "UPDATE long_term_memory SET last_accessed = created_at"
+                    " WHERE last_accessed IS NULL"
+                )
             self._conn.commit()
 
     def add(self, chat_id: int, fact: str) -> bool:
         """Store *fact* for *chat_id*.
 
-        Duplicate facts (exact match) are silently ignored.  When the cap is
-        reached the oldest fact is evicted to make room (LRU eviction).
+        Duplicate facts (exact match) are silently ignored but their
+        ``last_accessed`` timestamp is refreshed.  When the cap is reached
+        the least-recently-accessed fact is evicted (true LRU eviction).
 
         Returns:
             ``True`` if the fact was stored or already existed.
@@ -218,15 +236,21 @@ class LongTermMemory:
         if not fact:
             return False
         with self._lock:
-            # Deduplicate: skip if the exact fact is already stored
+            # Deduplicate: refresh last_accessed if the exact fact already exists
             existing = self._conn.execute(
-                "SELECT 1 FROM long_term_memory WHERE chat_id = ? AND fact = ?",
+                "SELECT id FROM long_term_memory WHERE chat_id = ? AND fact = ?",
                 (chat_id, fact),
             ).fetchone()
             if existing:
+                self._conn.execute(
+                    "UPDATE long_term_memory SET last_accessed = CURRENT_TIMESTAMP"
+                    " WHERE id = ?",
+                    (existing[0],),
+                )
+                self._conn.commit()
                 return True
 
-            # LRU eviction: delete the oldest fact when at cap
+            # True LRU eviction: delete the least-recently-accessed fact when at cap
             count = self._conn.execute(
                 "SELECT COUNT(*) FROM long_term_memory WHERE chat_id = ?",
                 (chat_id,),
@@ -237,7 +261,7 @@ class LongTermMemory:
                     DELETE FROM long_term_memory
                     WHERE id = (
                         SELECT id FROM long_term_memory
-                        WHERE chat_id = ? ORDER BY id LIMIT 1
+                        WHERE chat_id = ? ORDER BY last_accessed LIMIT 1
                     )
                     """,
                     (chat_id,),
@@ -251,13 +275,50 @@ class LongTermMemory:
         return True
 
     def get_all(self, chat_id: int) -> list[str]:
-        """Return all facts for *chat_id*, oldest first."""
+        """Return all facts for *chat_id*, oldest first, and refresh their access time."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT fact FROM long_term_memory WHERE chat_id = ? ORDER BY id",
                 (chat_id,),
             ).fetchall()
+            if rows:
+                self._conn.execute(
+                    "UPDATE long_term_memory SET last_accessed = CURRENT_TIMESTAMP"
+                    " WHERE chat_id = ?",
+                    (chat_id,),
+                )
+                self._conn.commit()
         return [row[0] for row in rows]
+
+    def replace_fact(self, chat_id: int, old_fact: str, new_fact: str) -> bool:
+        """Replace an existing *old_fact* with *new_fact* for *chat_id*.
+
+        If *old_fact* is not found, falls back to :meth:`add`.  The replacement
+        preserves the original row's ``created_at`` but updates ``last_accessed``.
+
+        Returns:
+            ``True`` if the replacement (or fallback add) succeeded.
+        """
+        old_fact = old_fact.strip()
+        new_fact = new_fact.strip()
+        if not new_fact:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM long_term_memory WHERE chat_id = ? AND fact = ?",
+                (chat_id, old_fact),
+            ).fetchone()
+            if row:
+                self._conn.execute(
+                    "UPDATE long_term_memory"
+                    " SET fact = ?, last_accessed = CURRENT_TIMESTAMP"
+                    " WHERE id = ?",
+                    (new_fact, row[0]),
+                )
+                self._conn.commit()
+                return True
+        # Old fact not found — just add the new one
+        return self.add(chat_id, new_fact)
 
     def count(self, chat_id: int) -> int:
         """Return the number of stored facts for *chat_id*."""
