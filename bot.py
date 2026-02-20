@@ -170,6 +170,10 @@ async def _update_rolling_summary(
 
 _START_TIME = time.monotonic()
 
+# Hold references to background tasks so they are not garbage-collected mid-flight.
+# See: https://docs.python.org/3/library/asyncio-task.html#creating-tasks
+_background_tasks: set[asyncio.Task] = set()
+
 # ── LLM-based intent router ───────────────────────────────────────────────────
 
 # Returns JSON so the LLM can also rewrite the search query in context, which
@@ -482,9 +486,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             memory.add(chat_id, "assistant", answer)
 
             # Extract and persist any memorable facts from this message too
-            asyncio.create_task(
+            task = asyncio.create_task(
                 _store_extracted_facts(chat_id, user_text, research_provider, long_term)
             )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
         except Exception as exc:
             logger.error(
                 "Auto-research error for chat %d: %s", chat_id, exc, exc_info=True
@@ -501,12 +507,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if memory.count(chat_id) >= memory.max_size - 1:
         old_msgs = memory.pop_oldest(chat_id, memory.max_size // 2)
         if old_msgs:
-            asyncio.create_task(
+            task = asyncio.create_task(
                 _update_rolling_summary(
-                    chat_id, old_msgs, memory.get_summary(chat_id),
+                    chat_id, old_msgs, summary,
                     research_provider, memory,
                 )
             )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
 
     memory.add(chat_id, "user", user_text)
     messages = memory.get(chat_id)
@@ -517,9 +525,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         memory.add(chat_id, "assistant", reply)
         await update.message.reply_text(reply)  # type: ignore[union-attr]
         # Extract and store any memorable facts in the background (no latency cost)
-        asyncio.create_task(
+        task = asyncio.create_task(
             _store_extracted_facts(chat_id, user_text, research_provider, long_term)
         )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     except PermissionError:
         logger.warning("403 permission error for chat %d", chat_id)

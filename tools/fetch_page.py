@@ -15,16 +15,11 @@ import urllib.request
 from dataclasses import dataclass
 from html.parser import HTMLParser
 
+from tools.http_utils import DEFAULT_HEADERS
+
 logger = logging.getLogger(__name__)
 
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate",
-}
+
 _TIMEOUT = 10       # seconds
 _MAX_RETRIES = 2
 _BASE_DELAY = 0.5
@@ -99,7 +94,7 @@ def _fetch_sync(url: str, max_chars: int) -> PageText:
     Retries up to :data:`_MAX_RETRIES` times on transient network errors.
     Returns an empty :class:`PageText` on unrecoverable failure.
     """
-    req = urllib.request.Request(url, headers=_HEADERS)
+    req = urllib.request.Request(url, headers=DEFAULT_HEADERS)
 
     for attempt in range(1, _MAX_RETRIES + 1):
         try:

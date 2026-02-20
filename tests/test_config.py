@@ -33,7 +33,7 @@ class TestLoadConfig:
         assert cfg.llm_provider == "openai"
         assert cfg.openai_api_key == "sk-test"
         assert cfg.openai_model == "gpt-4o-mini"  # default
-        assert cfg.memory_size == 10               # default
+        assert cfg.memory_size == 30               # default
 
     def test_valid_anthropic_config(self, monkeypatch):
         _env(

@@ -59,48 +59,6 @@ def load_config() -> Config:
             "ANTHROPIC_API_KEY must be set when LLM_PROVIDER=anthropic."
         )
 
-    raw_memory = os.getenv("MEMORY_SIZE", "30")
-    try:
-        memory_size = int(raw_memory)
-        if memory_size < 1:
-            raise ValueError
-    except ValueError:
-        raise ValueError(
-            f"MEMORY_SIZE must be a positive integer, got: {raw_memory!r}."
-        )
-
-    research_model = os.getenv("RESEARCH_MODEL", "").strip() or None
-
-    raw_rr = os.getenv("RESEARCH_RESULTS", "5")
-    try:
-        research_results = int(raw_rr)
-        if research_results < 1:
-            raise ValueError
-    except ValueError:
-        raise ValueError(
-            f"RESEARCH_RESULTS must be a positive integer, got: {raw_rr!r}."
-        )
-
-    raw_rsc = os.getenv("RESEARCH_SNIPPET_CHARS", "1200")
-    try:
-        research_snippet_chars = int(raw_rsc)
-        if research_snippet_chars < 100:
-            raise ValueError
-    except ValueError:
-        raise ValueError(
-            f"RESEARCH_SNIPPET_CHARS must be >= 100, got: {raw_rsc!r}."
-        )
-
-    raw_ttl = os.getenv("SEARCH_CACHE_TTL", "180")
-    try:
-        search_cache_ttl = int(raw_ttl)
-        if search_cache_ttl < 0:
-            raise ValueError
-    except ValueError:
-        raise ValueError(
-            f"SEARCH_CACHE_TTL must be a non-negative integer, got: {raw_ttl!r}."
-        )
-
     return Config(
         telegram_bot_token=token,
         llm_provider=provider,
@@ -108,13 +66,33 @@ def load_config() -> Config:
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         anthropic_api_key=anthropic_key,
         anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest"),
-        memory_size=memory_size,
-        research_model=research_model,
-        research_results=research_results,
-        research_snippet_chars=research_snippet_chars,
-        search_cache_ttl=search_cache_ttl,
+        memory_size=_require_int("MEMORY_SIZE", default="30", minimum=1),
+        research_model=os.getenv("RESEARCH_MODEL", "").strip() or None,
+        research_results=_require_int("RESEARCH_RESULTS", default="5", minimum=1),
+        research_snippet_chars=_require_int("RESEARCH_SNIPPET_CHARS", default="1200", minimum=100),
+        search_cache_ttl=_require_int("SEARCH_CACHE_TTL", default="180", minimum=0),
         memory_db_path=os.getenv("MEMORY_DB_PATH", "memory.db"),
     )
+
+
+def _require_int(name: str, *, default: str, minimum: int = 1) -> int:
+    """Return env var *name* as an ``int``, or raise ``ValueError``.
+
+    Args:
+        name:    Environment variable name.
+        default: Default string value if the variable is unset.
+        minimum: Minimum acceptable value (inclusive).
+    """
+    raw = os.getenv(name, default)
+    try:
+        val = int(raw)
+        if val < minimum:
+            raise ValueError
+    except ValueError:
+        raise ValueError(
+            f"{name} must be >= {minimum}, got: {raw!r}."
+        )
+    return val
 
 
 def _require(name: str) -> str:

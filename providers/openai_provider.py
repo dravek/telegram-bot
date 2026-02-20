@@ -8,7 +8,7 @@ rate-limit errors with exponential back-off; surfaces 403 errors as
 import asyncio
 import logging
 
-from openai import AsyncOpenAI, APIConnectionError, APIError, RateLimitError
+from openai import AsyncOpenAI, APIConnectionError, APIStatusError, RateLimitError
 
 from memory import Message
 from providers.base import BaseProvider
@@ -83,8 +83,8 @@ class OpenAIProvider(BaseProvider):
                 )
                 await asyncio.sleep(delay)
 
-            except APIError as exc:
-                if getattr(exc, "status_code", None) == 403:
+            except APIStatusError as exc:
+                if exc.status_code == 403:
                     logger.error("OpenAI 403 permission denied: %s", exc)
                     raise PermissionError("403 from OpenAI") from exc
                 raise

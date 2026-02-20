@@ -18,18 +18,12 @@ import urllib.request
 from dataclasses import dataclass
 from html.parser import HTMLParser
 
+from tools.http_utils import DEFAULT_HEADERS
+
 logger = logging.getLogger(__name__)
 
+
 _SEARCH_URL = "https://html.duckduckgo.com/html/?q={}&kl=us-en"
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate",
-    "DNT": "1",
-}
 _TIMEOUT = 10  # seconds per request
 _MAX_RETRIES = 3
 _BASE_DELAY = 1.0
@@ -48,6 +42,9 @@ class SearchResult:
 
 # ── TTL cache ─────────────────────────────────────────────────────────────────
 
+_MAX_CACHE_SIZE = 256  # max entries before forced cleanup
+
+
 class _CacheEntry:
     def __init__(self, results: list[SearchResult], ttl: int) -> None:
         self.results = results
@@ -63,6 +60,13 @@ _cache: dict[str, _CacheEntry] = {}
 
 def _cache_key(query: str) -> str:
     return hashlib.md5(query.lower().strip().encode()).hexdigest()
+
+
+def _evict_expired() -> None:
+    """Remove expired entries from the cache to prevent unbounded growth."""
+    expired = [k for k, v in _cache.items() if not v.is_fresh()]
+    for k in expired:
+        del _cache[k]
 
 
 # ── HTML parser ───────────────────────────────────────────────────────────────
@@ -82,6 +86,13 @@ def _extract_url(href: str) -> str:
         urls = qs.get("uddg", [])
         return urls[0] if urls else ""
     return href
+
+
+# Tags that are void (self-closing) and should not increment depth tracking
+_VOID_ELEMENTS = frozenset(
+    {"area", "base", "br", "col", "embed", "hr", "img", "input",
+     "link", "meta", "param", "source", "track", "wbr"}
+)
 
 
 class _DDGParser(HTMLParser):
@@ -142,7 +153,9 @@ class _DDGParser(HTMLParser):
                 self._depth = 1
         else:
             # Track nesting depth so we know when the active element closes
-            self._depth += 1
+            # Skip void elements — they have no closing tag
+            if tag not in _VOID_ELEMENTS:
+                self._depth += 1
 
     def handle_endtag(self, tag: str) -> None:
         if self._mode != 0 and self._depth > 0:
@@ -169,7 +182,7 @@ def _search_sync(query: str, max_results: int) -> list[SearchResult]:
     HTTP 4xx errors are not retried (permanent client errors).
     """
     url = _SEARCH_URL.format(urllib.parse.quote_plus(query))
-    req = urllib.request.Request(url, headers=_HEADERS)
+    req = urllib.request.Request(url, headers=DEFAULT_HEADERS)
 
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
@@ -239,6 +252,10 @@ async def search(
     if entry and entry.is_fresh():
         logger.debug("Cache hit for query %r", query)
         return entry.results
+
+    # Prevent unbounded cache growth
+    if len(_cache) >= _MAX_CACHE_SIZE:
+        _evict_expired()
 
     results = await asyncio.to_thread(_search_sync, query, max_results)
     _cache[key] = _CacheEntry(results, ttl)

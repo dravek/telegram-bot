@@ -67,7 +67,7 @@ class AnthropicProvider(BaseProvider):
             try:
                 response = await self._client.messages.create(
                     model=self._model,
-                    max_tokens=1024,
+                    max_tokens=4096,
                     system=system,
                     messages=api_messages,  # type: ignore[arg-type]
                 )
