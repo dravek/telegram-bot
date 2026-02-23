@@ -13,7 +13,8 @@ import sys
 from typing import Any
 
 from config import Config, load_config
-from memory import ConversationMemory, LongTermMemory
+from basenotes import BasenotesClient
+from memory import BasenotesTokenStore, ConversationMemory, LongTermMemory
 from providers.base import BaseProvider
 from bot import build_application
 
@@ -73,7 +74,21 @@ def main() -> None:
 
     memory = ConversationMemory(max_size=config.memory_size, db_path=config.memory_db_path)
     long_term_memory = LongTermMemory(db_path=config.memory_db_path)
-    application = build_application(config, provider, memory, research_provider, long_term_memory)
+    basenotes_client = BasenotesClient(
+        base_url=config.basenotes_base_url,
+        timeout=config.basenotes_timeout,
+    )
+    basenotes_tokens = BasenotesTokenStore(db_path=config.memory_db_path)
+
+    application = build_application(
+        config,
+        provider,
+        memory,
+        research_provider,
+        long_term_memory,
+        basenotes_client,
+        basenotes_tokens,
+    )
 
     logger.info(
         "Bot starting — provider=%s model=%s research_model=%s memory_size=%d long_term_memory_db=%s",

@@ -335,3 +335,57 @@ class LongTermMemory:
                 "DELETE FROM long_term_memory WHERE chat_id = ?", (chat_id,)
             )
             self._conn.commit()
+
+
+class BasenotesTokenStore:
+    """Persistent per-chat store for Basenotes API tokens."""
+
+    def __init__(self, db_path: str = "memory.db") -> None:
+        self._db_path = Path(db_path)
+        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._lock = Lock()
+        self._init_db()
+
+    def _init_db(self) -> None:
+        with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS basenotes_tokens (
+                    chat_id    INTEGER PRIMARY KEY,
+                    token      TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+            self._conn.commit()
+
+    def get(self, chat_id: int) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT token FROM basenotes_tokens WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        return row[0] if row else None
+
+    def set(self, chat_id: int, token: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO basenotes_tokens (chat_id, token, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    token = excluded.token,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, token),
+            )
+            self._conn.commit()
+
+    def clear(self, chat_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM basenotes_tokens WHERE chat_id = ?",
+                (chat_id,),
+            )
+            self._conn.commit()

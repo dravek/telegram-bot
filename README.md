@@ -9,6 +9,7 @@ A minimal, production-ready Telegram bot that chats using either **OpenAI** or *
 - 🔁 Automatic retry with exponential back-off for transient API errors
 - 🧠 Sliding-window memory per chat (configurable, default: 10 messages)
 - 📟 Commands: `/start`, `/help`, `/ping`, `/provider`, `/reset`
+- 📝 Basenotes API integration (list/create/edit notes)
 - 🪵 Structured logging to stdout
 - 🐍 Python 3.12+, minimal dependencies
 
@@ -39,6 +40,10 @@ python app.py
 | `/ping` | Liveness check + uptime |
 | `/provider` | Show active provider and model |
 | `/reset` | Clear conversation memory for this chat |
+| `/notes_token` | Store Basenotes API token for this chat |
+| `/notes` | List Basenotes notes (cursor pagination) |
+| `/note_create` | Create a Basenotes note |
+| `/note_edit` | Edit a Basenotes note |
 
 ## Environment Variables
 
@@ -51,6 +56,8 @@ python app.py
 | `ANTHROPIC_API_KEY` | ✅ if anthropic | — | Anthropic secret key |
 | `ANTHROPIC_MODEL` | ❌ | `claude-3-5-haiku-latest` | Anthropic model |
 | `MEMORY_SIZE` | ❌ | `10` | Messages kept per chat |
+| `BASENOTES_BASE_URL` | ❌ | `https://notes.dravek.com` | Basenotes API base URL |
+| `BASENOTES_TIMEOUT` | ❌ | `10` | Basenotes HTTP timeout (seconds) |
 
 ## Project Structure
 

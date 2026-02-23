@@ -29,6 +29,8 @@ class Config:
     research_snippet_chars: int     # chars extracted per page
     search_cache_ttl: int           # seconds to cache search results
     memory_db_path: str             # path to SQLite file for long-term memory
+    basenotes_base_url: str         # Base URL for Basenotes API
+    basenotes_timeout: float        # HTTP timeout in seconds
 
 
 def load_config() -> Config:
@@ -72,6 +74,8 @@ def load_config() -> Config:
         research_snippet_chars=_require_int("RESEARCH_SNIPPET_CHARS", default="1200", minimum=100),
         search_cache_ttl=_require_int("SEARCH_CACHE_TTL", default="180", minimum=0),
         memory_db_path=os.getenv("MEMORY_DB_PATH", "memory.db"),
+        basenotes_base_url=os.getenv("BASENOTES_BASE_URL", "https://notes.dravek.com"),
+        basenotes_timeout=_require_float("BASENOTES_TIMEOUT", default="10", minimum=1.0),
     )
 
 
@@ -86,6 +90,20 @@ def _require_int(name: str, *, default: str, minimum: int = 1) -> int:
     raw = os.getenv(name, default)
     try:
         val = int(raw)
+        if val < minimum:
+            raise ValueError
+    except ValueError:
+        raise ValueError(
+            f"{name} must be >= {minimum}, got: {raw!r}."
+        )
+    return val
+
+
+def _require_float(name: str, *, default: str, minimum: float = 0.1) -> float:
+    """Return env var *name* as a ``float``, or raise ``ValueError``."""
+    raw = os.getenv(name, default)
+    try:
+        val = float(raw)
         if val < minimum:
             raise ValueError
     except ValueError:

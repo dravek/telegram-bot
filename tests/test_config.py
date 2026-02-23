@@ -15,6 +15,9 @@ def _env(monkeypatch, **kwargs: str) -> None:
         "OPENAI_MODEL",
         "ANTHROPIC_MODEL",
         "MEMORY_SIZE",
+        "BASENOTES_BASE_URL",
+        "BASENOTES_TIMEOUT",
+        "MEMORY_DB_PATH",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in kwargs.items():

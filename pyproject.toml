@@ -25,7 +25,7 @@ where = ["."]
 include = ["providers*"]
 
 [tool.setuptools]
-py-modules = ["app", "bot", "config", "memory"]
+py-modules = ["app", "bot", "config", "memory", "basenotes"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
