@@ -37,7 +37,7 @@ class BasenotesClient:
         return url
 
     async def list_notes(
-        self, token: str, *, cursor: str | None = None, per_page: int | None = None
+        self, token: str, *, cursor: str | None = None, per_page: int | None = 20
     ) -> dict[str, Any]:
         return await self._request_json(
             "GET",
