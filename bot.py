@@ -282,10 +282,13 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "  \"what happened with OpenAI today\"_\n\n"
         "For deeper research: `/research --deep <topic>`\n\n"
         "*Basenotes* 📝\n"
-        "/notes_token <token>           — save your Basenotes API token\n"
-        "/notes [cursor]                — list notes (optional cursor)\n"
-        "/note_create <title> | <body>  — create a note\n"
-        "/note_edit <id> <title> | <body> — edit a note\n\n"
+        "/notes_token <token>            — save your Basenotes API token\n"
+        "/notes [cursor]                 — list notes (optional cursor)\n"
+        "/note_create <title> | <body>   — create a note\n"
+        "/note_create <title>\\n<body>    — create a note (newline body)\n"
+        "/note_edit <id> <title> | <body> — edit a note\n"
+        "/note_edit <id> <body>          — edit body only\n"
+        "/note_edit <id> <title>\\n<body> — edit with newline body\n\n"
         "💡 Switch providers: set `LLM_PROVIDER=openai` or `=anthropic`.",
         parse_mode="Markdown",
     )
@@ -370,14 +373,21 @@ def _command_payload(update: Update, command: str) -> str:
 
 
 def _split_title_body(payload: str) -> tuple[str, str] | None:
-    if "|" not in payload:
+    """Split a payload into (title, body) using '|' or newline."""
+    if "|" in payload:
+        left, right = payload.split("|", 1)
+        title = left.strip()
+        body = right.strip()
+        if title or body:
+            return title, body
         return None
-    left, right = payload.split("|", 1)
-    title = left.strip()
-    body = right.strip()
-    if not title or not body:
-        return None
-    return title, body
+    if "\n" in payload:
+        first, rest = payload.split("\n", 1)
+        title = first.strip()
+        body = rest.strip()
+        if title or body:
+            return title, body
+    return None
 
 
 def _format_ts(value: object) -> str:
@@ -461,9 +471,12 @@ async def note_create_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     payload = _command_payload(update, "note_create")
     parts = _split_title_body(payload)
-    if not parts:
+    if not parts or not parts[0] or not parts[1]:
         await update.message.reply_text(  # type: ignore[union-attr]
-            "Usage: /note_create <title> | <body>"
+            "Usage:\n"
+            "/note_create <title> | <body>\n"
+            "or\n"
+            "/note_create <title>\\n<body>"
         )
         return
     title, body = parts
@@ -505,17 +518,31 @@ async def note_edit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     parts = payload.split(None, 1)
     if len(parts) < 2:
         await update.message.reply_text(  # type: ignore[union-attr]
-            "Usage: /note_edit <id> <title> | <body>"
+            "Usage:\n"
+            "/note_edit <id> <title> | <body>\n"
+            "or\n"
+            "/note_edit <id> <body>\n"
+            "or\n"
+            "/note_edit <id> <title>\\n<body>"
         )
         return
     note_id, rest = parts[0], parts[1]
     title_body = _split_title_body(rest)
-    if not title_body:
-        await update.message.reply_text(  # type: ignore[union-attr]
-            "Usage: /note_edit <id> <title> | <body>"
-        )
-        return
-    title, body = title_body
+    if title_body:
+        title, body = title_body
+    else:
+        # Treat rest as body-only update
+        title, body = None, rest.strip()
+        if not body:
+            await update.message.reply_text(  # type: ignore[union-attr]
+                "Usage:\n"
+                "/note_edit <id> <title> | <body>\n"
+                "or\n"
+                "/note_edit <id> <body>\n"
+                "or\n"
+                "/note_edit <id> <title>\\n<body>"
+            )
+            return
     try:
         await client.update_note(token, note_id, title=title, content=body)
     except BasenotesAuthError:
@@ -783,7 +810,9 @@ def build_application(
     app.add_handler(CommandHandler("notes_token", notes_token_handler))
     app.add_handler(CommandHandler("notes", notes_list_handler))
     app.add_handler(CommandHandler("note_create", note_create_handler))
+    app.add_handler(CommandHandler("notes_create", note_create_handler))
     app.add_handler(CommandHandler("note_edit", note_edit_handler))
+    app.add_handler(CommandHandler("notes_edit", note_edit_handler))
     app.add_handler(CommandHandler("research", research_handler))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler)
