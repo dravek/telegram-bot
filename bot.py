@@ -11,6 +11,7 @@ import logging
 import re
 import time
 from datetime import timedelta
+from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.ext import (
@@ -21,8 +22,9 @@ from telegram.ext import (
     filters,
 )
 
+from basenotes import BasenotesAuthError, BasenotesClient, BasenotesError
 from config import Config
-from memory import ConversationMemory, LongTermMemory
+from memory import BasenotesTokenStore, ConversationMemory, LongTermMemory
 from providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
@@ -279,6 +281,11 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "  \"find me Python tutorials\"\n"
         "  \"what happened with OpenAI today\"_\n\n"
         "For deeper research: `/research --deep <topic>`\n\n"
+        "*Basenotes* 📝\n"
+        "/notes_token <token>           — save your Basenotes API token\n"
+        "/notes [cursor]                — list notes (optional cursor)\n"
+        "/note_create <title> | <body>  — create a note\n"
+        "/note_edit <id> <title> | <body> — edit a note\n\n"
         "💡 Switch providers: set `LLM_PROVIDER=openai` or `=anthropic`.",
         parse_mode="Markdown",
     )
@@ -350,6 +357,178 @@ async def forget_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id  # type: ignore[union-attr]
     long_term.clear(chat_id)
     await update.message.reply_text("🗑️ Long-term memories cleared.")  # type: ignore[union-attr]
+
+
+# ── Basenotes helpers and handlers ────────────────────────────────────────────
+
+def _command_payload(update: Update, command: str) -> str:
+    text = update.message.text or ""  # type: ignore[union-attr]
+    prefix = f"/{command}"
+    if not text.startswith(prefix):
+        return ""
+    return text[len(prefix):].strip()
+
+
+def _split_title_body(payload: str) -> tuple[str, str] | None:
+    if "|" not in payload:
+        return None
+    left, right = payload.split("|", 1)
+    title = left.strip()
+    body = right.strip()
+    if not title or not body:
+        return None
+    return title, body
+
+
+def _format_ts(value: object) -> str:
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, str):
+        return value
+    return "unknown"
+
+
+async def notes_token_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /notes_token — store Basenotes API token for this chat."""
+    tokens: BasenotesTokenStore = context.bot_data["basenotes_tokens"]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    payload = _command_payload(update, "notes_token")
+    if not payload:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Usage: /notes_token <token>\n"
+            "Generate it in Basenotes → Settings → API Tokens."
+        )
+        return
+    tokens.set(chat_id, payload)
+    masked = f"...{payload[-6:]}" if len(payload) > 6 else "(saved)"
+    await update.message.reply_text(  # type: ignore[union-attr]
+        f"✅ Basenotes token saved {masked}."
+    )
+
+
+async def notes_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /notes — list notes for the stored token."""
+    client: BasenotesClient = context.bot_data["basenotes_client"]
+    tokens: BasenotesTokenStore = context.bot_data["basenotes_tokens"]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    token = tokens.get(chat_id)
+    if not token:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Set your Basenotes token first: /notes_token <token>"
+        )
+        return
+    cursor = _command_payload(update, "notes") or None
+    try:
+        payload = await client.list_notes(token, cursor=cursor)
+    except BasenotesAuthError:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "🔒 Basenotes token is invalid or missing permissions."
+        )
+        return
+    except BasenotesError as exc:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            f"⚠️ Basenotes error: {exc}"
+        )
+        return
+
+    data = payload.get("data") or []
+    if not data:
+        await update.message.reply_text("No notes found.")  # type: ignore[union-attr]
+        return
+    lines = []
+    for i, item in enumerate(data, start=1):
+        note_id = item.get("id", "?")
+        title = item.get("title") or "(untitled)"
+        updated = _format_ts(item.get("updated_at"))
+        lines.append(f"{i}. {note_id} — {title} (updated {updated})")
+    message = "📝 Notes\n" + "\n".join(lines)
+    next_cursor = payload.get("next_cursor")
+    if next_cursor:
+        message += f"\n\nNext cursor: {next_cursor}\nUsage: /notes {next_cursor}"
+    await update.message.reply_text(message)  # type: ignore[union-attr]
+
+
+async def note_create_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /note_create — create a new Basenotes note."""
+    client: BasenotesClient = context.bot_data["basenotes_client"]
+    tokens: BasenotesTokenStore = context.bot_data["basenotes_tokens"]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    token = tokens.get(chat_id)
+    if not token:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Set your Basenotes token first: /notes_token <token>"
+        )
+        return
+    payload = _command_payload(update, "note_create")
+    parts = _split_title_body(payload)
+    if not parts:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Usage: /note_create <title> | <body>"
+        )
+        return
+    title, body = parts
+    try:
+        created = await client.create_note(token, title=title, content=body)
+    except BasenotesAuthError:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "🔒 Basenotes token is invalid or missing permissions."
+        )
+        return
+    except BasenotesError as exc:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            f"⚠️ Basenotes error: {exc}"
+        )
+        return
+    note_id = created.get("id") or "(unknown id)"
+    await update.message.reply_text(  # type: ignore[union-attr]
+        f"✅ Note created: {note_id}"
+    )
+
+
+async def note_edit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /note_edit — update an existing Basenotes note."""
+    client: BasenotesClient = context.bot_data["basenotes_client"]
+    tokens: BasenotesTokenStore = context.bot_data["basenotes_tokens"]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    token = tokens.get(chat_id)
+    if not token:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Set your Basenotes token first: /notes_token <token>"
+        )
+        return
+    payload = _command_payload(update, "note_edit")
+    if not payload:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Usage: /note_edit <id> <title> | <body>"
+        )
+        return
+    parts = payload.split(None, 1)
+    if len(parts) < 2:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Usage: /note_edit <id> <title> | <body>"
+        )
+        return
+    note_id, rest = parts[0], parts[1]
+    title_body = _split_title_body(rest)
+    if not title_body:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Usage: /note_edit <id> <title> | <body>"
+        )
+        return
+    title, body = title_body
+    try:
+        await client.update_note(token, note_id, title=title, content=body)
+    except BasenotesAuthError:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "🔒 Basenotes token is invalid or missing permissions."
+        )
+        return
+    except BasenotesError as exc:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            f"⚠️ Basenotes error: {exc}"
+        )
+        return
+    await update.message.reply_text("✅ Note updated.")  # type: ignore[union-attr]
 
 
 # ── Research handler ──────────────────────────────────────────────────────────
@@ -557,6 +736,8 @@ def build_application(
     memory: ConversationMemory,
     research_provider: BaseProvider,
     long_term_memory: LongTermMemory,
+    basenotes_client: BasenotesClient,
+    basenotes_tokens: BasenotesTokenStore,
 ) -> Application:
     """Build and configure the Telegram :class:`Application`.
 
@@ -570,6 +751,8 @@ def build_application(
         research_provider:  LLM provider instance for research summarisation
                             (may be the same object as *provider*).
         long_term_memory:   Persistent SQLite-backed fact store.
+        basenotes_client:   Basenotes API client for notes operations.
+        basenotes_tokens:   Persistent per-chat token store.
 
     Returns:
         A fully configured :class:`Application` ready to call
@@ -586,6 +769,8 @@ def build_application(
     app.bot_data["memory"] = memory
     app.bot_data["research_provider"] = research_provider
     app.bot_data["long_term_memory"] = long_term_memory
+    app.bot_data["basenotes_client"] = basenotes_client
+    app.bot_data["basenotes_tokens"] = basenotes_tokens
 
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", help_handler))
@@ -595,6 +780,10 @@ def build_application(
     app.add_handler(CommandHandler("memories", memories_handler))
     app.add_handler(CommandHandler("remember", remember_handler))
     app.add_handler(CommandHandler("forget", forget_handler))
+    app.add_handler(CommandHandler("notes_token", notes_token_handler))
+    app.add_handler(CommandHandler("notes", notes_list_handler))
+    app.add_handler(CommandHandler("note_create", note_create_handler))
+    app.add_handler(CommandHandler("note_edit", note_edit_handler))
     app.add_handler(CommandHandler("research", research_handler))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler)
