@@ -284,6 +284,8 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "*Basenotes* 📝\n"
         "/notes_token <token>            — save your Basenotes API token\n"
         "/notes [cursor]                 — list notes (optional cursor)\n"
+        "/note <id>                      — view a note\n"
+        "/notes_view <id>                — view a note (alias)\n"
         "/note_create <title> | <body>   — create a note\n"
         "/note_create <title>\\n<body>    — create a note (newline body)\n"
         "/note_edit <id> <title> | <body> — edit a note\n"
@@ -558,6 +560,50 @@ async def note_edit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("✅ Note updated.")  # type: ignore[union-attr]
 
 
+async def note_view_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /note — view a Basenotes note by id."""
+    client: BasenotesClient = context.bot_data["basenotes_client"]
+    tokens: BasenotesTokenStore = context.bot_data["basenotes_tokens"]
+    chat_id = update.effective_chat.id  # type: ignore[union-attr]
+    token = tokens.get(chat_id)
+    if not token:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Set your Basenotes token first: /notes_token <token>"
+        )
+        return
+    note_id = _command_payload(update, "note")
+    if not note_id:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Usage: /note <id>"
+        )
+        return
+    try:
+        payload = await client.get_note(token, note_id.strip())
+    except BasenotesAuthError:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "🔒 Basenotes token is invalid or missing permissions."
+        )
+        return
+    except BasenotesError as exc:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            f"⚠️ Basenotes error: {exc}"
+        )
+        return
+    note = payload.get("data") if isinstance(payload, dict) else None
+    if not note:
+        note = payload
+    title = note.get("title") if isinstance(note, dict) else None
+    body = None
+    if isinstance(note, dict):
+        body = note.get("content_md") or note.get("content") or note.get("body")
+    updated = _format_ts(note.get("updated_at")) if isinstance(note, dict) else "unknown"
+    title = title or "(untitled)"
+    body = body or ""
+    await update.message.reply_text(  # type: ignore[union-attr]
+        f"📝 {title}\nUpdated: {updated}\n\n{body}"
+    )
+
+
 # ── Research handler ──────────────────────────────────────────────────────────
 
 async def research_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -809,6 +855,8 @@ def build_application(
     app.add_handler(CommandHandler("forget", forget_handler))
     app.add_handler(CommandHandler("notes_token", notes_token_handler))
     app.add_handler(CommandHandler("notes", notes_list_handler))
+    app.add_handler(CommandHandler("note", note_view_handler))
+    app.add_handler(CommandHandler("notes_view", note_view_handler))
     app.add_handler(CommandHandler("note_create", note_create_handler))
     app.add_handler(CommandHandler("notes_create", note_create_handler))
     app.add_handler(CommandHandler("note_edit", note_edit_handler))

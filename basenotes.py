@@ -47,11 +47,17 @@ class BasenotesClient:
         )
 
     async def create_note(self, token: str, *, title: str, content: str) -> dict[str, Any]:
+        body = {
+            "title": title,
+            "content": content,
+            "body": content,
+            "content_md": content,
+        }
         return await self._request_json(
             "POST",
             "/api/v1/notes",
             token,
-            body={"title": title, "content": content},
+            body=body,
         )
 
     async def update_note(
@@ -67,11 +73,20 @@ class BasenotesClient:
             body["title"] = title
         if content is not None:
             body["content"] = content
+            body["body"] = content
+            body["content_md"] = content
         return await self._request_json(
             "PATCH",
             f"/api/v1/notes/{urllib.parse.quote(note_id)}",
             token,
             body=body,
+        )
+
+    async def get_note(self, token: str, note_id: str) -> dict[str, Any]:
+        return await self._request_json(
+            "GET",
+            f"/api/v1/notes/{urllib.parse.quote(note_id)}",
+            token,
         )
 
     async def delete_note(self, token: str, note_id: str) -> dict[str, Any]:
